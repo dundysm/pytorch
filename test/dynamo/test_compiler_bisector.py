@@ -14,9 +14,10 @@ from torch._inductor.test_case import TestCase
 from torch.library import _scoped_library, Library
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
+    onlyAccelerator,
     skipPRIVATEUSE1,
 )
-from torch.testing._internal.common_utils import HardwareClassification, requires_cuda
+from torch.testing._internal.common_utils import HardwareClassification
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 from torch.utils._triton import has_triton, has_triton_for_device
 
@@ -139,10 +140,9 @@ class TestCompilerBisector(TestCase):
         self.assertEqual(out.backend, "eager")
         self.assertEqual(out.subsystem, None)
 
-    # XPU doesn't support cudagrah
-    @requires_cuda
-    def test_cudagraph_bisect_max(self):
-        """Test that cudagraph bisector can limit number of cudagraphed graphs."""
+    @onlyAccelerator
+    def test_accgraph_bisect_max(self):
+        """Test that accgraph bisector can limit number of accgraphed graphs."""
         import os
         from unittest.mock import patch
 
@@ -155,9 +155,10 @@ class TestCompilerBisector(TestCase):
         def bar(x):
             return x * 2
 
+        graph_type = f"{DEVICE_TYPE}graphs".lower()
         env = {
             "TORCH_BISECT_BACKEND": "inductor",
-            "TORCH_BISECT_SUBSYSTEM": "cudagraphs",
+            "TORCH_BISECT_SUBSYSTEM": graph_type,
             "TORCH_BISECT_MAX": "0",
         }
 
@@ -175,7 +176,7 @@ class TestCompilerBisector(TestCase):
                 bar_c(x)
 
                 # With max=0, all graphs should be skipped
-                self.assertGreater(counters["inductor"]["cudagraph_skips"], 0)
+                self.assertGreater(counters["inductor"][graph_type + "_skips"], 0)
             finally:
                 CompilerBisector.bisection_enabled = False
                 get_env_val.cache_clear()
