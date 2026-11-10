@@ -126,7 +126,13 @@ from .base import (
     VariableTracker,
 )
 from .constant import ConstantVariable
-from .dicts import ConstDictVariable, OrderedDictVariable, pydict_check
+from .dicts import (
+    ConstDictVariable,
+    NNModuleHooksDictVariable,
+    NNModuleHooksOrderedDictVariable,
+    OrderedDictVariable,
+    pydict_check,
+)
 from .exception import ExceptionVariable
 from .hashable import HashableTracker
 from .lists import DequeVariable, ListVariable, TupleVariable
@@ -3424,6 +3430,12 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                     hints=[*graph_break_hints.FUNDAMENTAL],
                 )
 
+            if isinstance(self, ConstDictVariable) and isinstance(
+                method, types.MethodDescriptorType
+            ):
+                result = self.call_method_descriptor(tx, method, args, kwargs)
+                if result is not None:
+                    return result
             overloaded = (
                 self._base_methods is not None and method not in self._base_methods
             )
@@ -5308,7 +5320,9 @@ class UserDefinedDictVariable(UserDefinedObjectVariable, ConstDictVariable):
     def __init__(
         self,
         value: object,
-        items: dict[VariableTracker, VariableTracker] | None = None,
+        items: dict[VariableTracker, VariableTracker]
+        | dict[HashableTracker, VariableTracker]
+        | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(value, items=items if items is not None else {}, **kwargs)
@@ -5403,6 +5417,18 @@ class UserDefinedOrderedDictVariable(UserDefinedDictVariable, OrderedDictVariabl
         *UserDefinedDictVariable._nonvar_fields,
         *OrderedDictVariable._nonvar_fields,
     }
+
+
+class UserDefinedNNModuleHooksDictVariable(
+    UserDefinedDictVariable, NNModuleHooksDictVariable
+):
+    """Preserve subclass protocols while deferring local hook-ID specialization."""
+
+
+class UserDefinedNNModuleHooksOrderedDictVariable(
+    UserDefinedOrderedDictVariable, NNModuleHooksOrderedDictVariable
+):
+    """Ordered hook storage with the subclass's attributes and overrides."""
 
 
 # TODO: move to dicts.py alongside ConstDictVariable.
