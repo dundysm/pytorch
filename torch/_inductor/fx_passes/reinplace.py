@@ -12,7 +12,7 @@ import torch
 import torch.fx.node
 from torch._C._dynamo.guards import compute_overlapping_tensors
 from torch._dispatch.python import enable_python_dispatcher
-from torch._dynamo.utils import ReinplaceCounters, ReInplaceTrigger
+from torch._dynamo.utils import counters, ReinplaceCounters, ReInplaceTrigger
 from torch._guards import detect_fake_mode
 from torch._higher_order_ops.user_kernel_hop import (
     get_user_kernel_hop_info,
@@ -21,8 +21,11 @@ from torch._higher_order_ops.user_kernel_hop import (
 from torch._inductor import config, inductor_prims
 from torch._inductor.fx_utils import (
     _same_size_stride_and_storage_offset,
+    get_mutated_input_nodes,
+    get_mutated_storages,
     get_node_storage,
     is_node_realized,
+    same_tensor_meta,
 )
 from torch._inductor.lowering import (
     inplaceable_foreach_ops as inplaceable_foreach_ops_lowerings,
@@ -91,10 +94,9 @@ class ViewOp:
     kwargs: dict[str, Any]
 
 
-def _inplace_generalized_scatter(
-    inp: torch.Tensor, src: torch.Tensor, view_ops: list[ViewOp]
-) -> torch.Tensor:
-    tmp = inp
+def _apply_view_ops(base: torch.Tensor, view_ops: list[ViewOp]) -> torch.Tensor:
+    """Replay a generalized-scatter view chain on ``base``."""
+    tmp = base
     for view in view_ops:
         fake_args, fake_kwargs = pytree.tree_map(
             lambda node: node.meta["val"] if isinstance(node, torch.fx.Node) else node,
@@ -102,13 +104,20 @@ def _inplace_generalized_scatter(
         )
         # slice and select can allocate new unbacked symints, but those won't be reflected
         # in the output of this function, hence shall be ignored.
-        fake_mode = detect_fake_mode(fake_args)
+        fake_mode = detect_fake_mode((tmp, fake_args))
         with (
             fake_mode.shape_env.ignore_fresh_unbacked_symbols()
             if fake_mode and fake_mode.shape_env
             else nullcontext()
         ):
             tmp = view.target(tmp, *fake_args, **fake_kwargs)
+    return tmp
+
+
+def _inplace_generalized_scatter(
+    inp: torch.Tensor, src: torch.Tensor, view_ops: list[ViewOp]
+) -> torch.Tensor:
+    tmp = _apply_view_ops(inp, view_ops)
     try:
         tmp.copy_(src)
     except RuntimeError as e:
@@ -240,6 +249,64 @@ def should_reinplace_index_put(node: torch.fx.Node) -> bool:
     )
 
 
+def _is_inplace_mutation_result(inp: torch.fx.Node) -> bool:
+    """Recognize a functionalized mutation's realized output through views/getitems."""
+    cur = inp
+    hop = torch.ops.higher_order
+    while isinstance(cur, torch.fx.Node):
+        target = cur.target
+        if target in (hop.auto_functionalized_v2, hop.auto_functionalized):
+            return True
+        if cur.args and (target is operator.getitem or _is_view_op(target)):
+            cur = cur.args[0]  # type: ignore[assignment]
+            continue
+        break
+    return False
+
+
+def _scatter_input_realized_by_inplace_mutation(node: torch.fx.Node) -> bool:
+    """True if the scatter's destination buffer is force-realized because a
+    mutating op writes (a view of) it in place -- e.g. a custom op with
+    mutates_args, wrapped as auto_functionalized(_v2) or lowered to a direct
+    mutating call. In that case the buffer is already materialized, so the
+    FUNCTIONAL scatter cannot fuse with its input and degrades to a full-buffer
+    copy; reinplacing the scatter removes that copy. is_node_realized misses this
+    because the buffer's direct users are view ops (slice/as_strided), not the
+    mutating op. Correctness remains gated by can_inplace().
+
+    Writers wrapped in a control_deps subgraph (e.g. by overlap scheduling) are
+    not seen here, since get_mutated_input_nodes returns [] for that HOP; the
+    heuristic then just does not fire.
+    """
+    inp = node.args[0]
+    if not isinstance(inp, torch.fx.Node):
+        return False
+    # Upward: the destination is the result of an in-place mutation (the mutating
+    # op is upstream; e.g. still wrapped in auto_functionalized_v2 at this point).
+    if _is_inplace_mutation_result(inp):
+        return True
+    # Downward: a view of the destination is passed as a mutated arg to some op
+    # (e.g. a direct mutating call such as copy_ writing a disjoint slice of the
+    # buffer). Functionalized wrappers materialize their outputs, not their
+    # inputs; those outputs are covered by the upward case above.
+    # Only writers that precede the scatter count: a later writer does not make
+    # the buffer realized at this point.
+    seen = OrderedSet([inp])
+    stack = [inp]
+    while stack:
+        cur = stack.pop()
+        for user in cur.users:
+            if user is node:
+                continue
+            if user.target is operator.getitem or _is_view_op(user.target):
+                if user not in seen:
+                    seen.add(user)
+                    stack.append(user)
+            elif user < node and cur in get_mutated_input_nodes(user):
+                return True
+    return False
+
+
 def should_reinplace_scatter(node: torch.fx.Node) -> bool:
     """Choose between mutating and functional scatter decompositions
 
@@ -265,6 +332,19 @@ def should_reinplace_scatter(node: torch.fx.Node) -> bool:
     if is_node_realized(inp) and is_node_realized(node):  # type: ignore[arg-type]
         return True
 
+    # The destination is realized by an in-place mutation of one of its views
+    # (e.g. a custom op writing disjoint column slices of a concat buffer). The
+    # functional scatter would just copy that already-materialized buffer, so
+    # reinplacing strictly wins.
+    if (
+        config.reinplace_mutated_base_scatters
+        and is_node_realized(node)  # type: ignore[arg-type]
+        and _scatter_input_realized_by_inplace_mutation(node)
+    ):
+        counters["inductor"]["reinplace_mutated_base_scatter"] += 1
+        log.debug("reinplacing scatter %s into a base realized by mutation", node)
+        return True
+
     # If the output is copied back into the input, this forces both to be
     # realized as the output is a user of the input
     if inp.op in ("placeholder", "get_attr") and any(  # type: ignore[union-attr]
@@ -287,6 +367,90 @@ def should_reinplace_all_reduce(node: torch.fx.Node) -> bool:
 
     group_name = cast("torch.distributed.distributed_c10d.GroupName", node.args[2])
     return not is_symm_mem_enabled_for_group(group_name)
+
+
+def _src_is_view_of_inp(src: torch.fx.Node, inp: torch.fx.Node) -> bool:
+    """True if `src` reaches `inp` through view/getitem ops only."""
+    cur = src
+    while cur is not inp:
+        if not isinstance(cur, torch.fx.Node):
+            return False
+        if cur.target is operator.getitem and cur.args:
+            cur = cur.args[0]  # type: ignore[assignment]
+            continue
+        if cur.args and _is_view_op(cur.target):
+            cur = cur.args[0]  # type: ignore[assignment]
+            continue
+        return False
+    return True
+
+
+def remove_identity_generalized_scatters(graph: torch.fx.Graph) -> int:
+    """Drop functionalization's redundant ``scatter(inp, inp[region], region)``.
+
+    Run before the core pass introduces mutations. The alias and snapshot rules
+    are modeled on (and stricter than) remove_noop_ops. post_grad's
+    slice_scatter no-op replacement only matches a split/getitem/slice_scatter
+    chain; this handles any view chain (slice, select, diagonal, as_strided, or
+    several of them) that canonicalization folded into one _generalized_scatter.
+    Returns the number of removed nodes.
+    """
+    scatters = graph.find_nodes(op="call_function", target=_generalized_scatter)
+    if not scatters:
+        return 0
+    if graph.owning_module is None:
+        raise AssertionError("graph.owning_module must not be None")
+    input_storages = OrderedSet(
+        get_node_storage(n) for n in graph.nodes if n.op in ("placeholder", "get_attr")
+    )
+    output_storages = OrderedSet(
+        get_node_storage(n)
+        for n in pytree.tree_leaves(graph.output_node().args[0])
+        if isinstance(n, torch.fx.Node)
+    )
+    mutated_storages = get_mutated_storages(graph.owning_module)
+    for storages in (input_storages, output_storages):
+        storages.discard(None)
+    identities = []
+    for node in scatters:
+        inp, src = node.args[0], node.args[1]
+        if not (isinstance(inp, torch.fx.Node) and isinstance(src, torch.fx.Node)):
+            continue
+        if not _src_is_view_of_inp(src, inp):
+            continue
+        inp_storage = get_node_storage(inp)
+        if (
+            inp_storage is None
+            or inp_storage != get_node_storage(src)
+            or inp_storage in mutated_storages
+        ):
+            continue
+        inp_val = inp.meta.get("val")
+        if not isinstance(inp_val, torch.Tensor):
+            continue
+        try:
+            target_val = _apply_view_ops(inp_val, node.args[2])  # type: ignore[arg-type]
+        except GuardOnDataDependentSymNode:
+            continue
+        # Both the write and the clone must preserve the full tensor metadata.
+        if same_tensor_meta(src, target_val) and same_tensor_meta(inp, node):
+            identities.append(node)
+
+    # Propagate output storage backwards through identity chains without
+    # introducing new aliases between inputs or independently returned outputs.
+    removed = 0
+    for node in reversed(identities):
+        inp_storage = get_node_storage(node.args[0])  # type: ignore[arg-type]
+        if get_node_storage(node) in output_storages:
+            if inp_storage in input_storages or inp_storage in output_storages:
+                continue
+            output_storages.add(inp_storage)
+        counters["inductor"]["identity_generalized_scatter_removed"] += 1
+        log.debug("removing identity scatter %s", node)
+        node.replace_all_uses_with(node.args[0])  # type: ignore[arg-type]
+        graph.erase_node(node)
+        removed += 1
+    return removed
 
 
 def decompose_generalized_scatter(graph: torch.fx.Graph) -> None:
@@ -1082,5 +1246,12 @@ def reinplace_inplaceable_ops(
         # We run fake_tensor_updater to update the alias information.
         # Correct alias information is required for `reinplace_inplaceable_ops_core`.
         fake_tensor_updater.incremental_update()
+        # Drop functionalization's self-scatters before introducing mutations.
+        # Identity removal changes the alias information used by can_inplace.
+        if (
+            config.reinplace_mutated_base_scatters
+            and remove_identity_generalized_scatters(graph)
+        ):
+            fake_tensor_updater.incremental_update()
         reinplace_inplaceable_ops_core(graph)
         decompose_generalized_scatter(graph)
