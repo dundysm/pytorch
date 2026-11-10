@@ -15,7 +15,9 @@ import multiprocessing.reduction
 import operator
 import os
 import random
+import re
 import sys
+import time
 import types
 import typing
 import unittest
@@ -40,8 +42,18 @@ from torch._dynamo.testing import (
     expectedFailureDynamic,
     normalize_gm,
 )
-from torch._dynamo.utils import counters, ifdynstaticdefault, range_iterator, same
+from torch._dynamo.utils import (
+    counters,
+    ifdynstaticdefault,
+    is_function,
+    range_iterator,
+    same,
+)
 from torch._dynamo.variables import ConstantVariable, SkipFunctionVariable
+from torch._dynamo.variables.builder import (
+    bound_builtin_method_descriptor,
+    SourcelessBuilder,
+)
 from torch._dynamo.variables.functions import WrappedMethodDescriptorVariable
 from torch._dynamo.variables.lists import RangeVariable
 from torch._dynamo.variables.object_protocol import mro_attr_source
@@ -220,6 +232,19 @@ def deque_length_hints():
             pass
         hints.append(operator.length_hint(it))
     return tuple(hints)
+
+
+def _repr_hash_with_local_id(value: int) -> str:
+    token_id = id(object())
+    # Cancel the temporary ID so eager repetitions remain comparable.
+    return repr(token_id + value - token_id)
+
+
+class MethodKeyDict(dict):
+    pass
+
+
+_RANDOM_KEYS = (random.Random().random, random.Random().random)
 
 
 class FunctionTests(torch._dynamo.test_case.TestCase):
@@ -7311,7 +7336,8 @@ class GraphModule(torch.nn.Module):
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(opt_fn(x, a, a), (True, x + 1))
 
-    def test_bound_builtin_method_hash(self):
+    @parametrize("direct", [False, True])
+    def test_bound_builtin_method_hash(self, direct):
         receiver = [1, 1]
         source_backed = receiver.count
 
@@ -7324,7 +7350,9 @@ class GraphModule(torch.nn.Module):
         )
 
         def newly_bound(x):
-            return x + hash(list.count.__get__(receiver, list))
+            return x + hash(
+                receiver.count if direct else list.count.__get__(receiver, list)
+            )
 
         with self.assertRaises(Unsupported):
             torch.compile(newly_bound, backend="eager", fullgraph=True)(x)
@@ -7332,10 +7360,201 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(torch.compile(newly_bound, backend="eager")(x), newly_bound(x))
 
         def as_key(x):
-            return x + len({list.count.__get__(receiver, list): 1})
+            method = receiver.count if direct else list.count.__get__(receiver, list)
+            return x + len({method: 1})
 
         self.assertEqual(
             torch.compile(as_key, backend="eager", fullgraph=True)(x), as_key(x)
+        )
+
+    @parametrize("direct", [False, True])
+    def test_bound_builtin_method_constant_receiver_hash(self, direct):
+        def fn(x, receiver):
+            method = (
+                receiver.upper
+                if direct
+                else str.__dict__["upper"].__get__(receiver, str)
+            )
+            return x + 1, hash(method)
+
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        first = "".join(("hello", "world"))
+        second = first.encode().decode()
+        self.assertIsNot(first, second)
+        x = torch.ones(1)
+        for receiver in (first, second, first):
+            self.assertEqual(compiled(x, receiver), fn(x, receiver))
+        self.assertEqual(counter.frame_count, 2)
+
+    @parametrize("capture", ["aot", "cache"])
+    @parametrize("captured", [False, True])
+    def test_bound_builtin_method_constant_hash_cannot_be_saved(
+        self, capture, captured
+    ):
+        saved_receiver = "hello"
+
+        def fn(x, receiver):
+            receiver = saved_receiver if captured else receiver
+            return x + 1, hash(receiver.upper)
+
+        # The debug wrapper has a different, unresolvable top-frame package key.
+        with torch._dynamo.config.patch(
+            caching_precompile=capture == "cache", debug_force_nested_calls=False
+        ):
+            compiled = torch.compile(fn, backend="eager", fullgraph=True)
+            with self.assertRaisesRegex(Unsupported, "FakeIdVariable"):
+                if capture == "aot":
+                    compiled.aot_compile(((torch.ones(1), "hello"), {}))
+                else:
+                    compiled(torch.ones(1), "hello")
+
+    def test_bound_builtin_method_symbolic_receiver_identity(self):
+        def fn(x, n):
+            descriptor = int.__dict__["conjugate"]
+            return x + 1, descriptor.__get__(10001, int) == descriptor.__get__(n, int)
+
+        literal = next(value for value in fn.__code__.co_consts if value == 10001)
+        other = int("10001")
+        self.assertIsNot(literal, other)
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True, dynamic=True)
+        x = torch.ones(1)
+        for n in (literal, other, literal):
+            self.assertEqual(compiled(x, n), fn(x, n))
+        self.assertEqual(counter.frame_count, 2)
+
+    def test_bound_builtin_method_symbolic_receiver_after_hashing(self):
+        def fn(x, n):
+            method = int.__dict__["conjugate"].__get__(n, int)
+            mapping = {method: 1}
+            return x + method.__self__, x + method(), len(mapping)
+
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True, dynamic=True)
+        x = torch.ones(1)
+        for n in (10001, 10002):
+            self.assertEqual(compiled(x, n), fn(x, n))
+        self.assertEqual(counter.frame_count, 2)
+
+    def test_prebound_method_key_ignores_receiver_contents(self):
+        def fn(x, method):
+            name = method.__name__
+            return x + len({method}), name
+
+        receiver = {}
+        method = receiver.get
+
+        def inputs():
+            for key in range(3):
+                receiver[key] = key
+                yield method
+
+        self._check_key_reuse(fn, inputs(), frames=1)
+
+    @parametrize("constructed", [False, True])
+    def test_builtin_method_inherited_builtin_key_equality(self, constructed):
+        Record = collections.namedtuple("Record", "item")
+
+        class Text(str):
+            __slots__ = ()
+
+        class Pair(tuple):
+            __slots__ = ()
+
+        def fn(x, key):
+            receiver = []
+            method = list.append.__get__(receiver, list)
+            original = key
+            if constructed and isinstance(key, (str, tuple, frozenset)):
+                if type(key) is Record:
+                    key = type(key)(*key)
+                else:
+                    key = type(key)(list(key) if isinstance(key, frozenset) else key)
+            return x + len({key: 1, method: 2}), type(key), key == original
+
+        for candidate in (
+            torch.ones(1),
+            torch.Size([1]),
+            frozenset((1,)),
+            NoHint(),
+            enum.IntEnum("MethodKeyEnum", {"value": 1}).value,
+            Text("a"),
+            Pair((1,)),
+            Record(1),
+        ):
+            result = fn(torch.ones(1), candidate)
+            self.assertIs(result[1], type(candidate))
+            self.assertTrue(result[2])
+            self._check_key_reuse(fn, (candidate,), frames=1)
+            torch._dynamo.reset()
+
+    def test_builtin_method_subtype(self):
+        method = re.compile("a").match
+        method_type = type(method)
+
+        class Spoof:
+            @property
+            def __class__(self):
+                return type(method)
+
+        self.assertTrue(is_function(method))
+        self.assertFalse(is_function(Spoof()))
+        self.assertIsInstance(
+            SourcelessBuilder.create(None, method), SkipFunctionVariable
+        )
+        self.assertIs(bound_builtin_method_descriptor(method), re.Pattern.match)
+
+        def fn(x, bound):
+            result = x + (1 if isinstance(bound, method_type) else -1)
+            return result, bound.__self__ is method.__self__, type(bound)
+
+        x = torch.ones(1)
+        self.assertEqual(
+            torch.compile(fn, backend="eager", fullgraph=True)(x, method), fn(x, method)
+        )
+
+    @parametrize(
+        "factory, descriptor, size",
+        [
+            (lambda: [1], list.count, 2),
+            (lambda: tuple(range(1, 2)), tuple.count, 2),
+            (tuple, tuple.count, 1),
+            (lambda: frozenset([1]), frozenset.copy, 2),
+            (lambda: range(2), range.count, 2),
+            (lambda: collections.deque([1]), collections.deque.count, 2),
+            (collections.OrderedDict, dict.get, 2),
+            (collections.defaultdict, dict.get, 2),
+        ],
+    )
+    @parametrize("sourced", [False, True])
+    def test_builtin_method_key_receiver_identity(
+        self, factory, descriptor, size, sourced
+    ):
+        def fn(x, receiver):
+            if not sourced:
+                receiver = factory()
+            method = descriptor.__get__(receiver, type(receiver))
+            alias = descriptor.__get__(receiver, type(receiver))
+            other = descriptor.__get__(factory(), type(receiver))
+            return x + len({method, alias}), len({method, other})
+
+        x = torch.ones(1)
+        receiver = factory()
+        self.assertEqual(fn(x, receiver), (x + 1, size))
+        self._check_key_reuse(
+            fn, (receiver, factory()), frames=2 if sourced and size == 2 else 1
+        )
+
+    def test_literal_tuple_method_receiver_fallback(self):
+        def fn(x, receiver):
+            local = tuple.__dict__["count"].__get__((1,), tuple)
+            other = tuple.__dict__["count"].__get__(receiver, tuple)
+            return x + len({local, other})
+
+        literal = next(value for value in fn.__code__.co_consts if type(value) is tuple)
+        self._check_key_fallback(
+            fn, (literal, tuple(range(1, 2)), literal), "unstable receiver"
         )
 
     def test_prebound_method_descriptor_bypasses_subclass_override(self):
@@ -7667,6 +7886,155 @@ class GraphModule(torch.nn.Module):
         x = torch.ones(2)
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(opt_fn(x), fn(x))
+
+    @parametrize("wrap", [lambda fn: fn, lambda fn: (fn,), lambda fn: frozenset([fn])])
+    def test_skipped_builtin_function_keys(self, wrap):
+        def fn(x, second, first):
+            return x + len({wrap(first), wrap(second)})
+
+        self._check_key_reuse(fn, (time.perf_counter, time.time), time.time)
+
+    @parametrize("wrap", [None, tuple, frozenset])
+    @parametrize("first, other", [(int, str), ([].count, [].count), _RANDOM_KEYS])
+    def test_constructed_container_keys_guard_lazy_elements(self, wrap, first, other):
+        def fn(x, second, first):
+            if wrap is not None:
+                first, second = wrap([first]), wrap([second])
+            return x + len({first: 1, second: 2})
+
+        self._check_key_reuse(fn, (other, first, other), first)
+
+    def test_constructed_key_guards_avoid_metaclass_callbacks(self):
+        calls = []
+
+        class Meta(type):
+            def __eq__(cls, other):
+                if other is object:
+                    calls.append(other)
+                return type.__eq__(cls, other)
+
+            __hash__ = type.__hash__
+
+        class Key(metaclass=Meta):
+            pass
+
+        receiver = []
+
+        def fn(x, mapping, key):
+            marker = {list.count.__get__(receiver, list)}
+            return x + mapping[key] + len(marker)
+
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        key = Key()
+        x = torch.ones(1)
+        for value in (7, 8):
+            self.assertEqual(
+                compiled(x, {key: torch.full((1,), value)}, key), x + value + 1
+            )
+        self.assertEqual(counter.frame_count, 1)
+        self.assertEqual(calls, [])
+
+    def _check_key_fallback(self, fn, inputs, error, *args, positive_frames=False):
+        x = torch.ones(1)
+        counter = torch._dynamo.testing.CompileCounter()
+        with self.assertRaisesRegex(Unsupported, error):
+            torch.compile(fn, backend=counter, fullgraph=True)(x, inputs[0], *args)
+        torch._dynamo.reset()
+        fallback = torch.compile(fn, backend=counter)
+        for obj in inputs:
+            self.assertEqual(fallback(x, obj, *args), fn(x, obj, *args))
+        frames = counter.frame_count
+        if positive_frames:
+            self.assertGreater(frames, 0)
+        for obj in inputs:
+            self.assertEqual(fallback(x, obj, *args), fn(x, obj, *args))
+        self.assertEqual(counter.frame_count, frames)
+
+    def _check_key_reuse(self, fn, receivers, *args, frames=2):
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        x = torch.ones(1)
+        for receiver in receivers:
+            self.assertEqual(compiled(x, receiver, *args), fn(x, receiver, *args))
+        self.assertEqual(counter.frame_count, frames)
+
+    @parametrize(
+        "convert",
+        [
+            lambda h: h % 997,
+            repr,
+            str,
+            bool,
+            hex,
+            bin,
+            oct,
+            format,
+            _repr_hash_with_local_id,
+            lambda h: repr(h % 997),
+            lambda h: repr(-h),
+        ],
+    )
+    def test_skipped_builtin_hash_guard(self, convert):
+        method = random.Random().random
+
+        def fn(x, method):
+            return x + 1, convert(hash(method))
+
+        self._check_key_fallback(fn, (method,), "FakeIdVariable")
+        torch._dynamo.reset()
+        with self.assertRaisesRegex(Unsupported, "FakeIdVariable"):
+            torch.compile(fn, backend="eager", fullgraph=True).aot_compile(
+                ((torch.ones(1), method), {})
+            )
+
+    @parametrize("container", [dict, set])
+    def test_skipped_builtin_hash_keys(self, container):
+        def fn(x, method):
+            keys = (hash(method), hash(method))
+            result = dict.fromkeys(keys) if container is dict else set(keys)
+            return x + len(result)
+
+        self._check_key_reuse(fn, (random.Random().random,), frames=1)
+
+    @parametrize(
+        "wrap, depth",
+        [(tuple, 0), (tuple, 1), (tuple, 2), (frozenset, 1), (frozenset, 2)],
+    )
+    def test_bound_builtin_method_hash_local_receiver(self, wrap, depth):
+        def fn(x, _receiver):
+            method = list.count.__get__([1], list)
+            for _ in range(depth):
+                method = wrap((method,))
+            return x + 1, hash(method) == hash(method)
+
+        self._check_key_fallback(
+            fn, (None,), "builtin method hash with unstable receiver"
+        )
+
+    @parametrize("wrap", [None, tuple, frozenset, lambda _: frozenset([time.time])])
+    def test_bound_builtin_method_hash_cannot_escape(self, wrap):
+        def fn(x, obj):
+            value = time.time if wrap is None else wrap((obj.get,))
+            return x + 1, hash(value)
+
+        self._check_key_fallback(
+            fn,
+            (MethodKeyDict(a=1), MethodKeyDict(a=1)),
+            "Reconstruction of FakeIdVariable",
+        )
+
+    def test_bound_builtin_method_hash_receiver_alias(self):
+        def fn(x, b, a):
+            descriptor = int.__dict__["conjugate"]
+            left = descriptor.__get__(a, int)
+            right = descriptor.__get__(b, int)
+            return x + 1, hash(left) == hash(right)
+
+        a = int("1000000000001")
+        b = int("1000000000001")
+        self.assertIsNot(a, b)
+        self._check_key_reuse(fn, (b, a), a)
 
 
 class FunctionTestsCudaOnly(torch._dynamo.test_case.TestCase):

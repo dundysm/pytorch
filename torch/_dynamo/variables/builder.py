@@ -665,7 +665,7 @@ def lookup_spec_from_dynamo_source(
 
 
 def bound_builtin_method_descriptor(value: Any) -> Any | None:
-    if not isinstance(value, types.BuiltinMethodType):
+    if not issubclass(type(value), types.BuiltinMethodType):
         return None
 
     method_self = value.__self__
@@ -1633,7 +1633,10 @@ class VariableBuilder:
         elif istype(value, frozenset) and all(
             (
                 # For DBR quantization, we could get a frozenset of torch funcs.
-                (type(x) is types.BuiltinMethodType and x.__module__ == "torch")
+                (
+                    issubclass(type(x), types.BuiltinMethodType)
+                    and x.__module__ == "torch"
+                )
                 or
                 # Another commonly used frozenset of types.
                 x in torch.utils._pytree.BUILTIN_TYPES
@@ -1839,7 +1842,7 @@ class VariableBuilder:
             obj_vt = VariableTracker.build(self.tx, random_self, obj_source)
             return GetAttrVariable(obj_vt, value.__name__, py_type=type(value))
         elif (
-            isinstance(value, types.BuiltinMethodType)
+            issubclass(type(value), types.BuiltinMethodType)
             and isinstance(value.__self__, random.Random)
             and RandomVariable.is_supported_random_obj(value.__self__)
             and value in UserDefinedObjectVariable._supported_random_functions()

@@ -17,9 +17,9 @@ import types
 from typing import Any, cast, TYPE_CHECKING, TypeAlias
 
 from torch._C._dynamo import get_type_tp_name
-from torch._guards import Source
+from torch._guards import CompileContext, Source
 
-from .. import graph_break_hints, variables
+from .. import config, graph_break_hints, variables
 from ..bytecode_transformation import create_call_function
 from ..exc import (
     raise_attribute_error,
@@ -474,6 +474,8 @@ def _same_c_function(left: Any, right: Any) -> bool | None:
 
 
 def _bind_builtin_method(descriptor: Any, obj: Any) -> Any:
+    if not hasattr(descriptor, "__get__"):
+        return descriptor
     if isinstance(descriptor, types.ClassMethodDescriptorType):
         return descriptor.__get__(None, obj)
     # METH_METHOD descriptors need an explicit owner on Python 3.12.
@@ -570,7 +572,34 @@ class BoundBuiltinMethodVariable(VariableTracker):  # noqa: RVT001
         return f"BoundBuiltinMethodVariable({cls_name}.{self.descriptor.__name__}, {self.obj})"
 
     def python_type(self) -> type:
-        return types.BuiltinMethodType
+        return type(self.value) if self.value is not None else types.BuiltinMethodType
+
+    def has_fresh_container_receiver(self) -> bool:
+        return (
+            self.value is None
+            and self.obj.source is None
+            and (
+                (
+                    self.obj.mutation_type is not None
+                    and self.obj.mutation_type.scope > 0
+                )
+                or isinstance(self.obj, variables.RangeVariable)
+            )
+            and not (
+                isinstance(self.obj, variables.TupleVariable)
+                and self.obj.python_type() is tuple
+                and not self.obj.items
+            )
+        )
+
+    def key_hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        if self.value is not None:
+            return hash(self.value), False
+        obj = self.obj.realize()
+        if self.has_fresh_container_receiver():
+            # Internal bucket; equality still distinguishes C functions.
+            return id(obj), True
+        return self.tp_hash_impl(tx)
 
     def tp_hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
         # meth_hash: https://github.com/python/cpython/blob/e76aa128fe/Objects/methodobject.c#L319
@@ -578,7 +607,39 @@ class BoundBuiltinMethodVariable(VariableTracker):  # noqa: RVT001
         # real hash; a method bound during tracing gets a compile-time-only one.
         if self.value is not None:
             return hash(self.value), False
-        return id(self), True
+        obj = self.obj.realize()
+        if obj.source:
+            # Equal-valued receivers can have different identity-based method hashes.
+            install_guard(obj.source.make_guard(GuardBuilder.ID_MATCH))
+            receiver = tx.output.resolve_source_value(obj.source)
+        else:
+            receiver = obj.get_real_python_backed_value()
+            # Container VTs may materialize copies with no runtime-stable identity.
+            if (
+                receiver is NO_SUCH_SUBOBJ
+                or receiver is not obj.get_real_python_backed_value()
+            ):
+                # A receiver-only fake hash would conflate different C functions.
+                unimplemented(
+                    gb_type="builtin method hash with unstable receiver",
+                    context=f"{self}",
+                    explanation="Dynamo cannot compute the hash of a builtin method without a stable receiver identity.",
+                    hints=[
+                        "Bind the method on an input or another stable object.",
+                        *graph_break_hints.DIFFICULT,
+                    ],
+                )
+        # Ordinary compilation can pin a constant receiver. Saved graphs cannot
+        # retain its address-based hash when identity guards are filtered out.
+        context = CompileContext.try_get()
+        is_aot_capture = context is not None and context.is_aot_capture
+        is_fake = (
+            type(obj) is not ConstantVariable
+            or is_aot_capture
+            or config.caching_precompile
+            or tx.export
+        )
+        return hash(_bind_builtin_method(self.descriptor, receiver)), is_fake
 
     def tp_richcompare_impl(self, tx, other, op):
         # meth_richcompare: equal iff both are builtin methods with the same
@@ -595,7 +656,16 @@ class BoundBuiltinMethodVariable(VariableTracker):  # noqa: RVT001
 
         from .object_protocol import vt_identity_compare
 
-        same_self = vt_identity_compare(self.obj.realize(), other.obj.realize())
+        receivers = []
+        for obj in (self.obj.realize(), other.obj.realize()):
+            if obj.is_symnode_like() and obj.source is not None:
+                # Compare boxed identity without replacing the computational receiver.
+                install_guard(obj.source.make_guard(GuardBuilder.ID_MATCH))
+                obj = ConstantVariable.create(
+                    tx.output.resolve_source_value(obj.source)
+                )
+            receivers.append(obj)
+        same_self = vt_identity_compare(*receivers)
         eq = None
         if same_self is not None:
             eq = same_self.as_python_constant() and _same_c_function(
@@ -611,6 +681,8 @@ class BoundBuiltinMethodVariable(VariableTracker):  # noqa: RVT001
         return ConstantVariable.create(eq if op == "__eq__" else not eq)
 
     def as_python_constant(self) -> Any:
+        if self.value is not None:
+            return self.value
         obj = self.obj.as_python_constant()
         if hasattr(self.descriptor, "__get__"):
             return _bind_builtin_method(self.descriptor, obj)
