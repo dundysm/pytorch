@@ -36,6 +36,7 @@ import os
 import re
 import struct
 import sys
+import sysconfig
 import textwrap
 import threading
 import time
@@ -3284,6 +3285,14 @@ def enumerate_items_with_dict_position(
     with PyDict_Next / C++ DictGuardManager.
     """
     if issubclass(cast(type[dict[K, V]], type(obj)), OrderedDict):
+        # Older free-threaded mutators can free linked nodes outside this lock.
+        # CPython 3.14.1 adds the shared lock to PyODict_DelItem.
+        if sys.version_info < (3, 14, 1) and sysconfig.get_config_var(
+            "Py_GIL_DISABLED"
+        ):
+            raise InvalidOrderedDict(
+                "Native OrderedDict snapshots require Python 3.14.1+ on free-threaded builds"
+            )
         items = list(dict.items(obj))
         keys = torch._C._dynamo.guards.ordered_dict_keys(obj)
         positions = {id(key): (i, key, value) for i, (key, value) in enumerate(items)}
