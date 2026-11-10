@@ -2556,11 +2556,7 @@ class VariableBuilder:
                 source=self.source,
                 tx=self.tx,
             )
-        elif (
-            isinstance(value, (dict, collections.OrderedDict))
-            and type(value).__new__ is dict.__new__
-        ):
-            # Construct a dict_vt that will reside inside the UserDefinedDictVariable
+        elif issubclass(type(value), dict) and type(value).__new__ is dict.__new__:
             self.install_guards(GuardBuilder.TYPE_MATCH)
             self.install_guards(GuardBuilder.SEQUENCE_LENGTH)
 
@@ -2585,7 +2581,7 @@ class VariableBuilder:
                 build_key_value(i, k, v) for i, k, v in _dict_input_snapshot(value)
             )
 
-            if isinstance(value, collections.defaultdict):
+            if issubclass(type(value), collections.defaultdict):
                 factory_source = AttrSource(self.source, "default_factory")
                 result = UserDefinedDefaultDictVariable(
                     value,
@@ -2598,7 +2594,7 @@ class VariableBuilder:
             else:
                 udf_cls = (
                     UserDefinedOrderedDictVariable
-                    if isinstance(value, collections.OrderedDict)
+                    if issubclass(type(value), collections.OrderedDict)
                     else UserDefinedDictVariable
                 )
                 result = udf_cls(value, items=kv_items, source=self.source)
