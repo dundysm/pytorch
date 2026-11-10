@@ -93,6 +93,25 @@ class HookDictionaryTests(torch._dynamo.test_case.TestCase):
     hw_classification = HardwareClassification.GENERIC
 
     @parametrize("mapping_type", [dict, OrderedDict])
+    @parametrize("fromkeys", [False, True])
+    def test_detached_dictionary_observes_hook_keys(self, mapping_type, fromkeys):
+        def fn(x, module):
+            hooks = module._forward_hooks
+            detached = (
+                dict.fromkeys(hooks) if fromkeys else defaultdict(int).__ror__(hooks)
+            )
+            return x + (1 in detached)
+
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        x = torch.ones(1)
+        for keys in ((2, 3), (1, 3)):
+            module = torch.nn.Identity()
+            module._forward_hooks = mapping_type.fromkeys(keys, identity_forward_hook)
+            self.assertEqual(compiled(x, module), fn(x, module))
+        self.assertEqual(counter.frame_count, 2)
+
+    @parametrize("mapping_type", [dict, OrderedDict])
     @parametrize("subclass", [False, True])
     @parametrize(
         "operation, with_kwargs",
@@ -791,6 +810,20 @@ class HookDictionaryTests(torch._dynamo.test_case.TestCase):
         module = torch.nn.Identity()
         module.register_forward_hook(hook)
         self.assertEqual(compiled(x, module), x)
+
+    def test_hook_dict_copy_guard_keys(self):
+        def hook(module, args, output):
+            return output + 1
+
+        def fn(x, module):
+            return x + 1, module._forward_hooks.copy()
+
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.ones(2)
+        for _ in range(2):
+            module = torch.nn.Identity()
+            module.register_forward_hook(hook)
+            self.assertEqual(compiled(x, module), fn(x, module))
 
     @parametrize("view", ["keys", "items"])
     def test_hook_view_repr_observes_ids(self, view):

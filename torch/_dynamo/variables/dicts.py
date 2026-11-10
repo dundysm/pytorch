@@ -824,7 +824,7 @@ class ConstDictVariable(VariableTracker):  # noqa: RVT001
         name = descriptor.__name__
         if descriptor.__objclass__ is dict and name == "update":
             self.check_base_dict_mutation(tx, name)
-        if name not in ("keys", "values", "items", "__reversed__"):
+        if name not in ("keys", "values", "items", "__reversed__", "copy"):
             return None
         owner = descriptor.__objclass__
         if owner is dict:
@@ -881,7 +881,11 @@ class ConstDictVariable(VariableTracker):  # noqa: RVT001
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         self.install_dict_order_guard(tx)
-        return self._new_dict(self.materialize_keys().copy())
+        result = ConstDictVariable({}, mutation_type=ValueMutationNew())
+        if self.items:
+            # `PyDict_Copy` falls back to `PyDict_Merge` when `tp_iter` differs.
+            result.dict_merge(tx, self)
+        return result
 
     def dict_get(
         self,
@@ -1551,7 +1555,7 @@ class OrderedDictVariable(ConstDictVariable):  # noqa: RVT001
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         self.install_dict_order_guard(tx)
-        if self.python_type() is not collections.OrderedDict:
+        if not pyodict_checkexact(self):
             # odict_copy calls the subclass constructor, then its get/setitem hooks.
             cls = VariableTracker.build(tx, type).call_function(tx, [self], {})
             result = cls.call_function(tx, [], {})
@@ -1562,7 +1566,15 @@ class OrderedDictVariable(ConstDictVariable):  # noqa: RVT001
                 value = generic_getitem(tx, self, key.vt)
                 generic_setitem(tx, result, key.vt, value)
             return result
-        return ConstDictVariable.dict_copy(self, tx, args, kwargs)
+        if self._can_fast_merge(self):
+            return self._new_dict(self.items.copy())
+        result = self._new_dict({})
+        # Exact odict_copy hashes lookups, but inserts using the stored hashes.
+        for key in _iter_detecting_mutation(
+            HashableTracker.iter_keys_by_identity(self.items)
+        ):
+            result.items[key] = generic_getitem(tx, self, key.vt)
+        return result
 
     # ref: https://github.com/python/cpython/blob/c3aefdb9eff0734058376b96fc86d89b1a345d75/Objects/odictobject.c#L1378-L1403
     tp_methods = {
@@ -1621,27 +1633,21 @@ class OrderedDictVariable(ConstDictVariable):  # noqa: RVT001
     ) -> VariableTracker:
         # OrderedDict.__or__/__ror__ preserve the OrderedDict type, unlike
         # dict.__or__ which returns a plain dict for a subclass operand.
-        # ref: https://github.com/python/cpython/blob/3.13/Lib/collections/__init__.py#L327-L339
-        if not issubclass(other.python_type(), dict):
+        # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/odictobject.c#L896-L923
+        if not pydict_check(other):
             return ConstantVariable.create(NotImplemented)
+        # odict_or calls the subclass constructor, then bypasses copy/update overrides.
         left, right = (other, self) if reverse else (self, other)
         owner = (
             left if issubclass(left.python_type(), collections.OrderedDict) else self
         )
         if owner.python_type() is collections.OrderedDict:
             new = OrderedDictVariable({}, mutation_type=ValueMutationNew())
-            ConstDictVariable.dict_update(new, tx, [left], {})
+            OrderedDictVariable.tp_init_impl(new, tx, [left], {})
         else:
             cls = VariableTracker.build(tx, type).call_function(tx, [owner], {})
             new = cls.call_function(tx, [left], {})
-            if not isinstance(new, ConstDictVariable):
-                unimplemented(
-                    gb_type="Unsupported OrderedDict union result",
-                    context=new.python_type_name(),
-                    explanation="Dynamo cannot yet update a non-dictionary returned by an OrderedDict subclass constructor.",
-                    hints=[*graph_break_hints.SUPPORTABLE],
-                )
-        ConstDictVariable.dict_update(new, tx, [right], {})
+        OrderedDictVariable.odict_update(new, tx, [right], {})
         return new
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
