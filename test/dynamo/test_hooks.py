@@ -299,7 +299,7 @@ class HookDictionaryTests(torch._dynamo.test_case.TestCase):
             return x + (1 in result), type(result), tuple(result)
 
         counter = torch._dynamo.testing.CompileCounter()
-        compiled = torch.compile(fn, backend=counter, fullgraph=not custom_new)
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
         x = torch.ones(1)
         for keys in ((2, 3), (1, 3)):
             module = torch.nn.Identity()
@@ -308,8 +308,7 @@ class HookDictionaryTests(torch._dynamo.test_case.TestCase):
                 module._forward_hooks, dict.fromkeys(keys, identity_forward_hook)
             )
             self.assertEqual(compiled(x, module), fn(x, module))
-        if not custom_new:
-            self.assertEqual(counter.frame_count, 2)
+        self.assertEqual(counter.frame_count, 1 if custom_new else 2)
 
     def test_ordered_hook_subclass_copy_hooks(self):
         calls = []
@@ -758,6 +757,40 @@ class HookDictionaryTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(compiled(x, module), fn(x, module))
             expected = 1 if flags == (False, True) else 2
             self.assertEqual(counter.frame_count, expected)
+
+    @parametrize("base_type", [dict, OrderedDict, defaultdict])
+    @parametrize("subclass", [False, True])
+    @parametrize("operation", ["construct", "update", "ior"])
+    def test_mapping_copies_guard_hook_keys(self, base_type, subclass, operation):
+        class Mapping(base_type):
+            pass
+
+        mapping_type = Mapping if subclass else base_type
+
+        def hook(module, args, result):
+            return result
+
+        module = torch.nn.Identity()
+        key = module.register_forward_hook(hook).id
+
+        def fn(x, module):
+            args = (None,) if base_type is defaultdict else ()
+            if operation == "construct":
+                result = mapping_type(*args, module._forward_hooks)
+            else:
+                result = mapping_type(*args)
+                if operation == "update":
+                    result.update(module._forward_hooks)
+                else:
+                    result |= module._forward_hooks
+            return x + (key in result)
+
+        x = torch.zeros(1)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(compiled(x, module), x + 1)
+        module = torch.nn.Identity()
+        module.register_forward_hook(hook)
+        self.assertEqual(compiled(x, module), x)
 
     @parametrize("view", ["keys", "items"])
     def test_hook_view_repr_observes_ids(self, view):

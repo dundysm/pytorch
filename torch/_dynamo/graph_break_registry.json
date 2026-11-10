@@ -1,4 +1,14 @@
 {
+  "GB2484": [
+    {
+      "Gb_type": "Dictionary merge after iteration slot mutation",
+      "Context": "dict_merge: {other}",
+      "Explanation": "Dynamo cannot merge a dictionary after changing its type's __iter__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
   "GB0000": [
     {
       "Gb_type": "All __torch_function__ overrides returned NotImplemented due to TypeError from user code",
@@ -1536,6 +1546,16 @@
       "Explanation": "Attempted to read a cell variable that has not been populated yet.",
       "Hints": [
         "Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance(\"force_eager\")`. "
+      ]
+    }
+  ],
+  "GB4777": [
+    {
+      "Gb_type": "dict storage mutation on OrderedDict",
+      "Context": "dict.{name}",
+      "Explanation": "Base dict writes bypass OrderedDict's linked storage.",
+      "Hints": [
+        "Use OrderedDict methods to preserve its linked storage."
       ]
     }
   ],
