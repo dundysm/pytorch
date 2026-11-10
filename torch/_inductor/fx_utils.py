@@ -1,9 +1,10 @@
 # mypy: allow-untyped-defs
 import contextlib
 import contextvars
+import heapq
 import operator
 import warnings
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from collections.abc import (
     Callable,
     Collection,
@@ -180,6 +181,9 @@ def _is_fake_tensor_same(
 
     if not check_storage:
         return True
+
+    if not torch._C._has_storage(new) or not torch._C._has_storage(old_tensor):
+        return False
 
     if not statically_known_true(
         new.storage_offset() == old_tensor.storage_offset()
@@ -453,6 +457,12 @@ class _FxNodeHash:
     kwarg_hashes: tuple[int, ...]
 
 
+class _StorageCounts(ChainMap[int, int]):
+    def __missing__(self, key: int) -> int:
+        self.maps[0][key] = 0
+        return 0
+
+
 class FakeTensorUpdater:
     """
     The main idea here is that it's difficult to maintain accurate fake
@@ -495,6 +505,36 @@ class FakeTensorUpdater:
             self.processed_hashes.add(self.hash_node(node))
             self.tracked_node_ids.add(id(node))
 
+        self._targeted_processed_hashes: OrderedSet[_FxNodeHash] | None = None
+        self._node_hashes: dict[torch.fx.Node, _FxNodeHash] = {}
+        self._node_storages: dict[torch.fx.Node, int | None] = {}
+        self._storage_counts: dict[int, int] = {}
+
+    def _update_storage(self, node: torch.fx.Node) -> None:
+        storage = get_node_storage(node)
+        if node in self._node_storages:
+            old_storage = self._node_storages[node]
+            if old_storage == storage:
+                return
+            if old_storage is not None:
+                self._storage_counts[old_storage] -= 1
+                if self._storage_counts[old_storage] == 0:
+                    del self._storage_counts[old_storage]
+        self._node_storages[node] = storage
+        if storage is not None:
+            self._storage_counts[storage] = self._storage_counts.get(storage, 0) + 1
+
+    def _forget_node(self, node: torch.fx.Node) -> None:
+        old_hash = self._node_hashes.pop(node, None)
+        if old_hash is not None:
+            self.processed_hashes.discard(old_hash)
+        self.tracked_node_ids.discard(id(node))
+        storage = self._node_storages.pop(node, None)
+        if storage is not None:
+            self._storage_counts[storage] -= 1
+            if self._storage_counts[storage] == 0:
+                del self._storage_counts[storage]
+
     def hash_node(self, node: torch.fx.Node) -> _FxNodeHash:
         def get_hash_or_ids(n_iter: Iterable[Any]) -> tuple[int, ...]:
             """Replace unhashable items from the input with the ids of those items, and
@@ -517,10 +557,14 @@ class FakeTensorUpdater:
             get_hash_or_ids(chain.from_iterable(node.kwargs.items())),
         )
 
-    def incremental_update(self) -> int:
+    def incremental_update(
+        self, *, on_update: Callable[[torch.fx.Node], None] | None = None
+    ) -> int:
         """Update FakeTensors on self.graph. We will try to do the minimum amount of work.
 
-        Returns the number of nodes updated, including recursive updates on subgraphs."""
+        Returns the number of nodes updated, including recursive updates on subgraphs.
+        on_update receives each node reevaluated in this graph, excluding subgraph nodes.
+        """
         existing_storages: defaultdict[int, int] = defaultdict(int)
         for node in self.gm.graph.nodes:
             if storage := get_node_storage(node):
@@ -558,6 +602,8 @@ class FakeTensorUpdater:
             if "val" in node.meta and _is_fake_tensor_same(
                 new_fake_tensor, node.meta["val"], existing_storages, node=node
             ):
+                if on_update is not None:
+                    on_update(node)
                 return False
 
             storage_only_change = "val" in node.meta and _is_fake_tensor_same(
@@ -581,6 +627,9 @@ class FakeTensorUpdater:
 
             if storage := get_node_storage(node):
                 existing_storages[storage] += 1
+
+            if on_update is not None:
+                on_update(node)
 
             to_process.update(
                 id(user)
@@ -827,6 +876,201 @@ class FakeTensorUpdater:
         self.tracked_node_ids = OrderedSet(id(node) for node in self.gm.graph.nodes)
 
         return nodes_updated
+
+
+    def incremental_update_from_node(
+        self,
+        node: torch.fx.Node,
+        *,
+        additional_roots: Iterable[torch.fx.Node] = (),
+        erased_nodes: Iterable[torch.fx.Node] = (),
+        on_update: Callable[[torch.fx.Node], None] | None = None,
+    ) -> int:
+        """Refresh a rewritten node and propagate metadata changes to its users.
+
+        The caller must include independently rewritten consumers in additional_roots
+        and removed nodes in erased_nodes. Other graph edits require a full update.
+        Graph inputs must retain their metadata, as required by incremental_update.
+        Graphs with subgraphs use the full update to keep shared callers consistent.
+        Storage bookkeeping is initialized once, and rebuilt after a full update.
+        Returns the number of updated nodes, with the same callback as incremental_update.
+        """
+        roots = OrderedSet(chain((node,), additional_roots))
+        removed = OrderedSet(erased_nodes)
+        for changed in chain(roots, removed):
+            if changed.graph is not self.gm.graph:
+                raise AssertionError("metadata updates require nodes from the owning graph")
+        for erased in removed:
+            if not erased._erased:
+                raise AssertionError("erased_nodes must contain erased nodes")
+        if self.subgraph_updaters:
+            return self.incremental_update(on_update=on_update)
+        if self._targeted_processed_hashes is not self.processed_hashes:
+            self._node_hashes = {h.node: h for h in self.processed_hashes}
+            self._node_storages.clear()
+            self._storage_counts.clear()
+            for existing in self.gm.graph.nodes:
+                self._update_storage(existing)
+        self._targeted_processed_hashes = None
+        for erased in removed:
+            self._forget_node(erased)
+        existing_storages = _StorageCounts({}, self._storage_counts)
+        pending: list[torch.fx.Node] = []
+        scheduled = OrderedSet[torch.fx.Node]()
+
+        def schedule(node: torch.fx.Node) -> None:
+            if not node._erased and node not in scheduled:
+                scheduled.add(node)
+                heapq.heappush(pending, node)
+
+        def update_node_fake_tensor(node: torch.fx.Node, new_fake_tensor: Any) -> bool:
+            if "val" in node.meta and _is_fake_tensor_same(
+                new_fake_tensor, node.meta["val"], existing_storages, node=node
+            ):
+                if on_update is not None:
+                    on_update(node)
+                return False
+
+            storage_only_change = "val" in node.meta and _is_fake_tensor_same(
+                new_fake_tensor,
+                node.meta["val"],
+                existing_storages,
+                check_storage=False,
+                node=node,
+            )
+
+            rebind_unbacked(V.fake_mode.shape_env, node, new_fake_tensor)
+
+            node.meta["val"] = new_fake_tensor
+
+            if (shape_env := V.fake_mode.shape_env) and (
+                symbol_to_path := compute_unbacked_bindings(shape_env, new_fake_tensor)
+            ):
+                node.meta["unbacked_bindings"] = symbol_to_path
+
+            if storage := get_node_storage(node):
+                existing_storages[storage] += 1
+
+            if on_update is not None:
+                on_update(node)
+
+            for user in node.users:
+                if (
+                    storage_only_change
+                    and getattr(
+                        user.target,
+                        "_inductor_lowering_output_metadata_ignores_input_storage",
+                        False,
+                    )
+                    and getattr(
+                        user.target,
+                        "_inductor_lowering_output_metadata_is_input",
+                        None,
+                    )
+                    is None
+                ):
+                    continue
+                schedule(user)
+
+            return True
+
+        for root in roots:
+            schedule(root)
+        current_node_hashes: dict[torch.fx.Node, _FxNodeHash] = {}
+        nodes_updated = 0
+        while pending:
+            current = heapq.heappop(pending)
+            current_node_hashes[current] = self.hash_node(current)
+            if current in roots and not callable(current.target):
+                for user in current.users:
+                    schedule(user)
+            if hasattr(current.target, "_inductor_lowering_function"):
+                if metadata_fn := getattr(
+                    current.target, "_inductor_lowering_output_metadata_fn", None
+                ):
+                    is_valid, args, kwargs = get_fake_args_kwargs(current, self.gm)
+                    if not is_valid:
+                        raise RuntimeError(
+                            "FakeTensorUpdater cannot update "
+                            "_inductor_lowering_function metadata because the "
+                            "metadata provider inputs are unavailable. "
+                            f"Encountered node: {current.format_node()}"
+                        )
+                    with V.fake_mode, enable_python_dispatcher():
+                        new_fake_tensor = metadata_fn(*args, **kwargs)
+                elif (
+                    metadata_input := getattr(
+                        current.target, "_inductor_lowering_output_metadata_is_input", None
+                    )
+                ) is not None:
+                    new_fake_tensor = self._get_targeted_lowering_input_metadata(
+                        current, metadata_input
+                    )
+                else:
+                    raise RuntimeError(
+                        "FakeTensorUpdater cannot recompute metadata for "
+                        "_inductor_lowering_function nodes after their dependencies "
+                        "change because those targets expect Inductor IR inputs rather "
+                        "than FakeTensor inputs. "
+                        f"Encountered node with changed dependency: {current.format_node()}"
+                    )
+            else:
+                is_valid, args, kwargs = get_fake_args_kwargs(current, self.gm)
+                if not is_valid or not callable(current.target):
+                    continue
+                with V.fake_mode, enable_python_dispatcher():
+                    if current.target is torch.ops.higher_order.with_effects:
+                        new_fake_tensor = current.target.dispatch(
+                            torch._C.DispatchKey.Python, *args, **kwargs
+                        )
+                    else:
+                        new_fake_tensor = current.target(*args, **kwargs)
+            nodes_updated += update_node_fake_tensor(current, new_fake_tensor)
+
+        storage_updates = OrderedSet(current_node_hashes)
+        for visited in current_node_hashes:
+            storage_updates.update(visited.all_input_nodes)
+        for visited in storage_updates:
+            self._update_storage(visited)
+        for visited, node_hash in current_node_hashes.items():
+            if (old_hash := self._node_hashes.get(visited)) is not None:
+                self.processed_hashes.discard(old_hash)
+            self._node_hashes[visited] = node_hash
+            self.processed_hashes.add(node_hash)
+            self.tracked_node_ids.add(id(visited))
+        self._targeted_processed_hashes = self.processed_hashes
+        return nodes_updated
+
+    def _get_targeted_lowering_input_metadata(
+        self, node: torch.fx.Node, input_name: int | str
+    ) -> Any:
+        raw_input = (
+            node.args[input_name]
+            if isinstance(input_name, int)
+            else node.kwargs[input_name]
+        )
+
+        def has_missing_fake_metadata(input_node: torch.fx.Node) -> bool:
+            return not (
+                "val" in input_node.meta
+                or "example_value" in input_node.meta
+                or (
+                    input_node.op == "get_attr"
+                    and isinstance(input_node.target, str)
+                    and hasattr(self.gm, input_node.target)
+                )
+            )
+
+        if any(
+            isinstance(leaf, torch.fx.Node) and has_missing_fake_metadata(leaf)
+            for leaf in pytree.tree_leaves(raw_input)
+        ):
+            raise RuntimeError(
+                "FakeTensorUpdater cannot update pass-through "
+                "_inductor_lowering_function metadata because the input "
+                f"metadata is unavailable. Encountered node: {node.format_node()}"
+            )
+        return tree_map(partial(get_fake, gm=self.gm), raw_input)
 
 
 def get_storage(t: torch.Tensor) -> int:

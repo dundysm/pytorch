@@ -1,6 +1,8 @@
 # Owner(s): ["module: inductor"]
 
 import operator
+from collections import Counter
+from unittest import mock
 
 import torch
 import torch._inductor.config as inductor_config
@@ -14,7 +16,7 @@ from torch._higher_order_ops.auto_functionalize import (
 )
 from torch._inductor import inductor_prims
 from torch._inductor.fx_passes.reinplace import reinplace_inplaceable_ops_core
-from torch._inductor.fx_utils import FakeTensorUpdater
+from torch._inductor.fx_utils import FakeTensorUpdater, get_node_storage
 from torch._inductor.virtualized import V
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
 from torch.testing._internal.common_utils import (
@@ -125,6 +127,256 @@ class TestReinplacingPassCorrectness(InductorTestCase):
             return x.index_put((y,), const)
 
         self._test(f)
+
+    @parametrize("e2e", [False, True])
+    @parametrize("use_view", [False, True])
+    def test_chained_reinplacement_preserves_last_result(self, e2e, use_view):
+        class Model(torch.nn.Module):
+            def forward(self, x, indices, first_values, second_values, replacement):
+                first = x.index_put((indices,), first_values)
+                view = first.view_as(first) if use_view else first
+                second = view.index_put((indices,), second_values)
+                x.copy_(replacement)
+                return second
+
+        model = Model()
+        x = torch.arange(8, dtype=torch.float32).reshape(2, 4).clone()
+        inputs = (
+            torch.tensor([0]),
+            torch.full((4,), 10.0),
+            torch.full((4,), 20.0),
+            torch.full_like(x, -1.0),
+        )
+        expected_input = x.clone()
+        expected = model(expected_input, *inputs)
+        actual_input = x.clone()
+        if e2e:
+            compiled = torch.compile(model, fullgraph=True)
+        else:
+            compiled = make_fx(model, tracing_mode="fake")(x, *inputs)
+            reinplace_inplaceable_ops_core(compiled.graph)
+            compiled.graph.lint()
+            compiled.recompile()
+        actual = compiled(actual_input, *inputs)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual_input, expected_input)
+        if not e2e:
+            first = next(
+                n for n in compiled.graph.nodes if n.target is aten.index_put_.default
+            )
+            second = next(
+                n for n in compiled.graph.nodes if n.target is aten.index_put.default
+            )
+            self.assertEqual(get_node_storage(first), get_node_storage(first.args[0]))
+            self.assertNotEqual(get_node_storage(second), get_node_storage(first))
+
+    def test_reinplacement_refreshes_sparse_output(self):
+        def f(values, sparse_indices, indices, updates):
+            values = values + 1
+            values = values.index_put((indices,), updates)
+            return aten._sparse_coo_tensor_with_dims_and_tensors.default(
+                1, 1, [4, 2], sparse_indices, values, layout=torch.sparse_coo
+            )
+
+        inputs = (
+            torch.arange(6, dtype=torch.float32).reshape(3, 2),
+            torch.tensor([[0, 1, 3]]),
+            torch.tensor([1]),
+            torch.full((1, 2), 10.0),
+        )
+        gm = make_fx(f, tracing_mode="fake")(*inputs)
+        reinplace_inplaceable_ops_core(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertIn(aten.index_put_.default, [n.target for n in gm.graph.nodes])
+        self.assertEqual(gm(*inputs).to_dense(), f(*inputs).to_dense())
+
+    def test_targeted_metadata_refresh_preserves_unrelated_nodes(self):
+        def f(x, y, indices, updates):
+            base = x.cos()
+            result = base.index_put((indices,), updates)
+            return result.view(-1), y.sin()
+
+        inputs = (
+            torch.randn(2, 4),
+            torch.randn(8),
+            torch.tensor([0]),
+            torch.full((1, 4), 10.0),
+        )
+        gm = make_fx(f, tracing_mode="fake")(*inputs)
+        updater = FakeTensorUpdater(gm)
+        root = next(n for n in gm.graph.nodes if n.target is aten.index_put.default)
+        view = next(n for n in gm.graph.nodes if n.target is aten.view.default)
+        unrelated = next(n for n in gm.graph.nodes if n.target is aten.sin.default)
+        original_unrelated = unrelated.meta["val"]
+        root.target = aten.index_put_.default
+        fake_mode = detect_fake_mode([root.meta["val"]])
+        updated = []
+        with V.set_fake_mode(fake_mode):
+            updater.incremental_update_from_node(root)
+            with mock.patch.object(
+                type(gm.graph),
+                "nodes",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError("targeted refresh must not scan the graph"),
+            ):
+                updater.incremental_update_from_node(root, on_update=updated.append)
+            self.assertEqual(updater.incremental_update(), 0)
+        self.assertEqual(get_node_storage(view), get_node_storage(root.args[0]))
+        self.assertIs(unrelated.meta["val"], original_unrelated)
+        self.assertEqual(set(updated), {root, view})
+        gm.graph.lint()
+        gm.recompile()
+        self.assertEqual(gm(*inputs), f(*inputs))
+
+    def test_targeted_metadata_refresh_orders_multiple_roots(self):
+        def f(x):
+            return x[:4] + x[:4]
+
+        gm = make_fx(f, tracing_mode="fake")(torch.randn(8))
+        updater = FakeTensorUpdater(gm)
+        roots = [n for n in gm.graph.nodes if n.target is aten.slice.Tensor]
+        for root in roots:
+            root.update_arg(3, 2)
+        join = next(n for n in gm.graph.nodes if n.target is aten.add.Tensor)
+        updated = []
+        with V.set_fake_mode(detect_fake_mode([roots[0].meta["val"]])):
+            updater.incremental_update_from_node(
+                roots[1], additional_roots=[roots[0]], on_update=updated.append
+            )
+            self.assertEqual(updater.incremental_update(), 0)
+        self.assertEqual(join.meta["val"].shape, (2,))
+        self.assertEqual(updated, [*roots, join])
+
+    def test_targeted_metadata_refresh_replacements_and_cache_revert(self):
+        def f(x, y):
+            root = x.sin()
+            base = y.cos()
+            return root, base.clone().view(-1)
+
+        gm = make_fx(f, tracing_mode="fake")(torch.randn(4), torch.randn(2, 2))
+        updater = FakeTensorUpdater(gm)
+        root = next(n for n in gm.graph.nodes if n.target is aten.sin.default)
+        base = next(n for n in gm.graph.nodes if n.target is aten.cos.default)
+        removed = next(n for n in gm.graph.nodes if n.target is aten.clone.default)
+        consumers = list(removed.users)
+        original_base = base.meta["val"]
+        old_hash = updater.hash_node(removed)
+        removed.replace_all_uses_with(base)
+        gm.graph.erase_node(removed)
+        root.target = aten.cos.default
+        with V.set_fake_mode(detect_fake_mode([root.meta["val"]])):
+            updater.incremental_update_from_node(
+                root, additional_roots=consumers, erased_nodes=[removed]
+            )
+            self.assertEqual(updater.incremental_update(), 0)
+            root.target = aten.sin.default
+            self.assertGreater(updater.incremental_update(), 0)
+            updater.incremental_update_from_node(root)
+        self.assertIs(base.meta["val"], original_base)
+        self.assertEqual(get_node_storage(consumers[0]), get_node_storage(base))
+        self.assertNotIn(removed, updater._node_hashes)
+        self.assertNotIn(removed, updater._node_storages)
+        self.assertNotIn(old_hash, updater.processed_hashes)
+        self.assertNotIn(id(removed), updater.tracked_node_ids)
+        expected_counts = Counter(
+            storage
+            for n in gm.graph.nodes
+            if (storage := get_node_storage(n)) is not None
+        )
+        self.assertEqual(updater._storage_counts, expected_counts)
+
+    @parametrize("provider", ["function", "input", "unsupported"])
+    def test_targeted_metadata_refresh_lowering(self, provider):
+        def f(x):
+            return x.sin().view(-1)
+
+        def lowering(x):
+            raise AssertionError("lowerings require IR inputs")
+
+        lowering._inductor_lowering_function = True
+        if provider == "function":
+            lowering._inductor_lowering_output_metadata_fn = lambda x: x
+        elif provider == "input":
+            lowering._inductor_lowering_output_metadata_is_input = 0
+        gm = make_fx(f, tracing_mode="fake")(torch.randn(2, 2))
+        updater = FakeTensorUpdater(gm)
+        root = next(n for n in gm.graph.nodes if n.target is aten.sin.default)
+        view = next(n for n in gm.graph.nodes if n.target is aten.view.default)
+        root.target = lowering
+        with V.set_fake_mode(detect_fake_mode([root.meta["val"]])):
+            if provider == "unsupported":
+                with self.assertRaisesRegex(RuntimeError, "cannot recompute metadata"):
+                    updater.incremental_update_from_node(root)
+            else:
+                updater.incremental_update_from_node(root)
+                self.assertEqual(updater.incremental_update(), 0)
+                self.assertEqual(get_node_storage(view), get_node_storage(root.args[0]))
+
+    def test_targeted_metadata_refresh_subgraph_fallback(self):
+        def f(x, pred):
+            value = x.sin()
+            return torch.ops.higher_order.cond(
+                pred, lambda x: (x.cos(),), lambda x: (x.neg(),), (value,)
+            )
+
+        inputs = (torch.randn(4), torch.tensor(True))
+        gm = make_fx(f, tracing_mode="fake")(*inputs)
+        updater = FakeTensorUpdater(gm)
+        root = next(n for n in gm.graph.nodes if n.target is aten.sin.default)
+        self.assertTrue(updater.subgraph_updaters)
+        root.target = aten.cos.default
+        with V.set_fake_mode(detect_fake_mode([root.meta["val"]])):
+            with mock.patch.object(
+                updater, "incremental_update", wraps=updater.incremental_update
+            ) as full_update:
+                updater.incremental_update_from_node(root)
+                full_update.assert_called_once()
+        gm.graph.lint()
+        gm.recompile()
+        self.assertEqual(gm(*inputs), (inputs[0].cos().cos(),))
+
+    def test_targeted_metadata_refresh_recovers_after_callback_error(self):
+        gm = make_fx(lambda x: x.sin().view(-1), tracing_mode="fake")(torch.randn(4))
+        updater = FakeTensorUpdater(gm)
+        root = next(n for n in gm.graph.nodes if n.target is aten.sin.default)
+        view = next(n for n in gm.graph.nodes if n.target is aten.view.default)
+        root.target = aten.cos.default
+        with V.set_fake_mode(detect_fake_mode([root.meta["val"]])):
+            with self.assertRaisesRegex(RuntimeError, "callback failed"):
+                updater.incremental_update_from_node(
+                    root, on_update=mock.Mock(side_effect=RuntimeError("callback failed"))
+                )
+            self.assertIsNone(updater._targeted_processed_hashes)
+            updater.incremental_update_from_node(root)
+            self.assertEqual(updater.incremental_update(), 0)
+        self.assertEqual(get_node_storage(view), get_node_storage(root))
+
+    def test_reinplacement_drains_repeated_copy_replacements(self):
+        def f(x, y, z, indices, updates):
+            outputs = []
+            for x in (x, y, z):
+                result = x.index_put((indices,), updates)
+                x.copy_(result)
+                outputs.append(x.view(-1))
+            return tuple(outputs)
+
+        inputs = (
+            torch.randn(8), torch.randn(8), torch.randn(8),
+            torch.tensor([0]), torch.tensor([2.0]),
+        )
+        gm = make_fx(f, tracing_mode="fake")(*inputs)
+        expected_inputs = tuple(x.clone() for x in inputs)
+        expected = f(*expected_inputs)
+        reinplace_inplaceable_ops_core(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        actual_inputs = tuple(x.clone() for x in inputs)
+        self.assertEqual(gm(*actual_inputs), expected)
+        self.assertEqual(actual_inputs, expected_inputs)
+        targets = [n.target for n in gm.graph.nodes]
+        self.assertEqual(targets.count(aten.index_put_.default), 3)
+        self.assertNotIn(aten.copy_.default, targets)
 
     def test_should_modify_inner(self):
         def f(x, y):
@@ -636,7 +888,8 @@ class TestReinplacingPassCorrectness(InductorTestCase):
         f(x)
         self.assertEqual(num_reinplacing_failures(), 0)
 
-    def test_with_effects_metadata_refresh_unbacked_symbols(self):
+    @parametrize("targeted", [False, True])
+    def test_with_effects_metadata_refresh_unbacked_symbols(self, targeted):
         from torch._higher_order_ops.effects import with_effects
 
         def f(x, y):
@@ -657,7 +910,10 @@ class TestReinplacingPassCorrectness(InductorTestCase):
         wrapped.update_arg(2, other_input)
         fake_mode = detect_fake_mode([node.meta.get("val") for node in gm.graph.nodes])
         with V.set_fake_mode(fake_mode):
-            updater.incremental_update()
+            if targeted:
+                updater.incremental_update_from_node(wrapped)
+            else:
+                updater.incremental_update()
             self.assertEqual(updater.incremental_update(), 0)
         self.assertEqual(wrapped.meta.get("unbacked_bindings"), original_bindings)
         self.assertEqual(fake_mode.shape_env.pending_fresh_unbacked_symbols, [])
