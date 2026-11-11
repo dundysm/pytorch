@@ -6653,12 +6653,79 @@ class TestCppFakeTensorModeBindings(TestCase):
                 fake + fake
 
     @skipIfTorchDynamo(_CPP_FAKE_DYNAMO_SKIP)
+    def test_fake_fallback_sparse(self):
+        import threading
+
+        mode = CppFakeTensorMode()
+        device = torch.device("cpu")
+
+        def check(out, shape):
+            self.assertIs(maybe_get_fake_mode(out), mode)
+            self.assertEqual(out.device, device)
+            self.assertEqual(out.shape, shape)
+
+        meta = torch.eye(2).to_sparse().to("meta")
+        sparse = torch._C._from_meta_and_device(meta, device, mode)
+        # _coalesced_ and add must run their sparse Meta kernels.
+        with torch._C._AutoDispatchBelowADInplaceOrView():
+            self.assertIs(torch.ops.aten._coalesced_(sparse, False), sparse)
+        self.assertFalse(sparse.is_coalesced())
+        # clone uses CompositeExplicitAutograd for COO.
+        cloned = sparse.clone()
+        # add's Meta kernel would make a dense output
+        added = sparse + sparse
+        for out in (cloned, added):
+            check(out, (2, 2))
+            self.assertTrue(out.is_sparse)
+        # with sparse invariant checks (which TestCase turns on) off, as Python
+        # does, but on this thread only
+        self.assertTrue(torch.sparse.check_sparse_tensor_invariants.is_enabled())
+        checks = []
+        thread_checks = []
+
+        def sparse_probe_meta(t):
+            checks.append(torch.sparse.check_sparse_tensor_invariants.is_enabled())
+            thread = threading.Thread(
+                target=lambda: thread_checks.append(
+                    torch.sparse.check_sparse_tensor_invariants.is_enabled()
+                )
+            )
+            thread.start()
+            thread.join()
+            return t.clone()
+
+        with torch.library._scoped_library("_test_fake_fallback_sparse", "DEF") as lib:
+            lib.define("probe(Tensor x) -> Tensor")
+            lib.impl("probe", sparse_probe_meta, "SparseMeta")
+            check(torch.ops._test_fake_fallback_sparse.probe(sparse), (2, 2))
+        self.assertEqual(checks, [False])
+        self.assertEqual(thread_checks, [True])
+        self.assertTrue(torch.sparse.check_sparse_tensor_invariants.is_enabled())
+        # Bypass ADInplaceOrView's own copies to check the fallback's copies.
+        with torch._C._AutoDispatchBelowADInplaceOrView():
+            meta_values, meta_indices = meta._values(), meta._indices()
+            values, indices = sparse._values(), sparse._indices()
+            check(values, meta_values.shape)
+            check(indices, meta_indices.shape)
+            self.assertIsNot(sparse._values(), values)
+            self.assertIsNot(sparse._indices(), indices)
+            values.resize_(5)
+            self.assertEqual(values.shape, (5,))
+            self.assertEqual(sparse._values().shape, meta_values.shape)
+            self.assertFalse(is_fake_tensor(meta_values))
+            self.assertFalse(is_fake_tensor(meta_indices))
+        csr_meta = torch.eye(2).to_sparse_csr().to("meta")
+        csr = torch._C._from_meta_and_device(csr_meta, device, mode)
+        check(csr.crow_indices(), csr_meta.crow_indices().shape)
+
+    @skipIfTorchDynamo(_CPP_FAKE_DYNAMO_SKIP)
     def test_fake_fallback_rejects_sparse(self):
         mode = CppFakeTensorMode()
         meta = torch.eye(2).to_sparse().to("meta")
         fake = torch._C._from_meta_and_device(meta, torch.device("cpu"), mode)
-        with self.assertRaisesRegex(NotImplementedError, "sparse inputs"):
-            fake + fake
+        msg = "sparse inputs to ops without a sparse Meta kernel"
+        with self.assertRaisesRegex(NotImplementedError, msg):
+            aten.log_sigmoid_forward(fake)
 
     @skipIfTorchDynamo(_CPP_FAKE_DYNAMO_SKIP)
     @parametrize("scalar_argument", [False, True])
