@@ -2210,12 +2210,11 @@ class TestSparseCSRDevice(TestCase):
             test_shape(7, 8, 9, 20, False, index_dtype, (1, 1))
             test_shape(7, 8, 9, 20, True, index_dtype, (1, 1))
 
-    @onlyCPU
-    @dtypes(torch.float, torch.double)
+    @dtypes(*floating_and_complex_types())
     def test_sparse_addmm_csr_strided_dense_and_out(self, device, dtype):
         crow_indices = torch.tensor([0, 2, 2, 5, 6], device=device, dtype=torch.int64)
         col_indices = torch.tensor([0, 3, 1, 2, 4, 3], device=device, dtype=torch.int64)
-        values = torch.arange(1, 7, device=device, dtype=dtype)
+        values = torch.arange(1, 7, device=device).to(dtype)
         sparse = torch.sparse_csr_tensor(
             crow_indices, col_indices, values, (4, 5), device=device
         )
