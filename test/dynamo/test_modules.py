@@ -1345,6 +1345,222 @@ class NNModuleTests(torch._dynamo.test_case.TestCase):
                 self.assertEqual(cnt.frame_count, 2)
                 self.assertEqual(cnt.op_count, 3)
 
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_attributes_read_before_graph_break(self):
+        class RecurrentModel(torch.nn.Module):
+            def __init__(self, recurrent_cls) -> None:
+                super().__init__()
+                self.pre = torch.nn.Linear(8, 8)
+                self.rnn = recurrent_cls(8, 8, num_layers=2, batch_first=True)
+                self.post = torch.nn.Linear(8, 4)
+
+            def forward(self, x):
+                x = self.pre(x)
+                layers = self.rnn.num_layers * (2 if self.rnn.bidirectional else 1)
+                hidden = torch.zeros(layers, x.size(0), self.rnn.hidden_size)
+                x, _ = self.rnn(x, hidden)
+                return self.post(x[:, -1, :])
+
+        inp = torch.randn(2, 3, 8)
+
+        for recurrent_cls in (torch.nn.RNN, torch.nn.GRU):
+            with self.subTest(recurrent_cls=recurrent_cls):
+                m = RecurrentModel(recurrent_cls).eval()
+                backend = torch._dynamo.testing.EagerAndRecordGraphs()
+                opt_m = torch.compile(m, backend=backend)
+
+                r = opt_m(inp)
+
+                self.assertEqual(r, m(inp))
+                self.assertEqual(len(backend.graphs), 2)
+                targets = [n.target for n in backend.graphs[0].graph.nodes]
+                self.assertIn(torch.zeros, targets)
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    @parametrize("attr_name", ("offset", "__getattribute__"))
+    def test_rnn_attributes_respect_pending_class_mutation(self, attr_name):
+        class CustomGRU(torch.nn.GRU):
+            offset = 1
+
+        def getter(self, name):
+            if name == "offset":
+                return 2
+            return object.__getattribute__(self, name)
+
+        def fn(x, rnn):
+            if attr_name == "offset":
+                CustomGRU.offset = 2
+            else:
+                CustomGRU.__getattribute__ = getter
+            return x + rnn.offset
+
+        rnn = CustomGRU(8, 8)
+        inp = torch.ones(3)
+        expected = fn(inp, rnn)
+        delattr(CustomGRU, attr_name)
+        if attr_name == "offset":
+            CustomGRU.offset = 1
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), expected)
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    @parametrize("dict_mode", ("mixin", "reused_descriptor"))
+    def test_rnn_attributes_respect_inherited_shadowed_dict(self, dict_mode):
+        class Mixin:
+            @property
+            def __dict__(self):
+                return {}
+
+        if dict_mode == "mixin":
+
+            class CustomGRU(torch.nn.GRU, Mixin):
+                offset = 1
+
+        else:
+
+            class CustomGRU(torch.nn.GRU):
+                offset = 1
+                __dict__ = torch.nn.Module.__dict__["__dict__"]
+
+        def fn(x, rnn):
+            return x + rnn.offset
+
+        rnn = CustomGRU(8, 8)
+        rnn.offset = 2
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_attributes_respect_metaclass_getattribute(self):
+        class CustomMeta(type):
+            def __getattribute__(self, name):
+                value = type.__getattribute__(self, name)
+                if name == "__dict__" and "offset" in value:
+                    return {**value, "offset": 2}
+                return value
+
+        class CustomGRU(torch.nn.GRU, metaclass=CustomMeta):
+            offset = 1
+
+        def fn(x, rnn):
+            return x + rnn.offset
+
+        rnn = CustomGRU(8, 8)
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    @parametrize("container_type", (list, tuple, set, frozenset))
+    def test_rnn_attributes_preserve_container_identity(self, container_type):
+        def fn(x, rnn):
+            return x + (1 if rnn.config is rnn.config else 2)
+
+        rnn = torch.nn.GRU(8, 8)
+        rnn.config = container_type((1, 2))
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_custom_equality_respects_attribute_changes(self):
+        class CustomGRU(torch.nn.GRU):
+            offset = 1
+
+            def __eq__(self, other):
+                return self.offset == 1
+
+            __hash__ = torch.nn.GRU.__hash__
+
+        def fn(x, rnn):
+            return x + (1 if rnn == int else 2)  # noqa: E721
+
+        rnn = CustomGRU(8, 8)
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+        rnn.offset = 2
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_attributes_recompile_after_change(self):
+        def fn(x, rnn):
+            return x + rnn.offset
+
+        rnn = torch.nn.GRU(8, 8)
+        rnn.offset = 1
+        inp = torch.ones(3)
+        cnt = torch._dynamo.testing.CompileCounter()
+        opt_fn = torch.compile(fn, backend=cnt)
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+        self.assertEqual(cnt.frame_count, 1)
+        rnn.offset = 2
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+        self.assertEqual(cnt.frame_count, 2)
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_attributes_respect_custom_getattribute(self):
+        class CustomGRU(torch.nn.GRU):
+            offset = 1
+
+            def __getattribute__(self, name):
+                if name == "offset":
+                    return 2
+                return super().__getattribute__(name)
+
+        def fn(x, rnn):
+            return x + rnn.offset
+
+        rnn = CustomGRU(8, 8)
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_attributes_respect_descriptor_getattribute(self):
+        class GetterDescriptor:
+            def __get__(self, obj, cls=None):
+                if obj is None:
+                    return self
+
+                def getter(name):
+                    if name == "offset":
+                        return 2
+                    return object.__getattribute__(obj, name)
+
+                return getter
+
+        class DescriptorGRU(torch.nn.GRU):
+            offset = 1
+            __getattribute__ = GetterDescriptor()
+
+        def fn(x, rnn):
+            return x + rnn.offset
+
+        rnn = DescriptorGRU(8, 8)
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
+    @torch._dynamo.config.patch(allow_rnn=False)
+    def test_rnn_attributes_respect_shadowed_dict(self):
+        class ShadowDictGRU(torch.nn.GRU):
+            offset = 1
+
+            @property
+            def __dict__(self):
+                return super().__dict__
+
+        def fn(x, rnn):
+            return x + rnn.offset
+
+        rnn = ShadowDictGRU(8, 8)
+        rnn.offset = 2
+        inp = torch.ones(3)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(opt_fn(inp, rnn), fn(inp, rnn))
+
     @patch.object(torch._dynamo.config, "allow_unspec_int_on_nn_module", True)
     def test_self_mutating1(self):
         m1 = torch.nn.Linear(10, 10)
@@ -1850,6 +2066,9 @@ class NNModuleTests(torch._dynamo.test_case.TestCase):
             res3 = opt_mod(x)
             self.assertTrue(torch.allclose(ref3, res3))
             self.assertEqual(cnt.frame_count, ifdynstaticdefault(2, 1))
+
+
+instantiate_parametrized_tests(NNModuleTests)
 
 
 class NNModuleTestsDevice(torch._dynamo.test_case.TestCase):

@@ -65,7 +65,9 @@ from ..source import (
 from ..utils import (
     check_positional,
     check_unspec_or_constant_args,
+    get_type_mro_no_user_code,
     istype,
+    iter_mro_static_dicts,
     no_keywords,
     proxy_args_kwargs,
     raise_args_mismatch,
@@ -89,7 +91,7 @@ from .functions import (
     UserFunctionVariable,
     UserMethodVariable,
 )
-from .object_protocol import mro_attr_source, python_constant_repr_impl
+from .object_protocol import mro_attr_source, mro_lookup, python_constant_repr_impl
 from .user_defined import (
     call_random_fn,
     is_standard_setattr,
@@ -529,9 +531,29 @@ class UnknownVariable(VariableTracker):  # noqa: RVT001
     """
 
 
+def _has_plain_attribute_lookup(value: object) -> bool:
+    if mro_lookup(type(value), "__getattribute__") is not object.__getattribute__:
+        return False
+    # getattr_static skips the instance dictionary if any MRO entry shadows it.
+    for cls, namespace in iter_mro_static_dicts(type(value)):
+        if mro_lookup(type(cls), "__getattribute__") is not type.__getattribute__:
+            return False
+        if "__dict__" not in namespace:
+            continue
+        descriptor = namespace["__dict__"]
+        if not (
+            type(descriptor) is types.GetSetDescriptorType
+            and descriptor.__name__ == "__dict__"
+            and descriptor.__objclass__ is cls
+        ):
+            return False
+    return True
+
+
 class DelayGraphBreakVariable(UnknownVariable):  # noqa: RVT001
     """
-    Used to insert a dummy variable in the stack to do the graph break at CALL_FUNCTION.
+    Delays a graph break until a call, while allowing ordinary scalar attributes
+    of an unsupported RNN module to be read as guarded constants.
     """
 
     def __init__(
@@ -539,12 +561,33 @@ class DelayGraphBreakVariable(UnknownVariable):  # noqa: RVT001
         msg: str | None = None,
         hints: list[str] | None = None,
         callable_var: VariableTracker | None = None,
+        module: object | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.msg = msg
         self.hints = hints or []
         self.callable_var = callable_var
+        self.module = module
+
+    def const_getattr(self, tx: "InstructionTranslatorBase", name: str) -> Any:
+        if self.module is None:
+            return super().const_getattr(tx, name)
+        side_effects = tx.output.side_effects
+        for obj in (self.module, *get_type_mro_no_user_code(type(self.module))):
+            if obj in side_effects and side_effects.has_pending_mutation(
+                side_effects[obj]
+            ):
+                return super().const_getattr(tx, name)
+        if not _has_plain_attribute_lookup(self.module):
+            return super().const_getattr(tx, name)
+        try:
+            value = inspect.getattr_static(self.module, name)
+        except AttributeError:
+            raise NotImplementedError from None
+        if not ConstantVariable.is_base_literal(value):
+            return super().const_getattr(tx, name)
+        return value
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         if self.callable_var is None:
